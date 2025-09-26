@@ -1,0 +1,474 @@
+
+import os
+import sys
+import socket
+import threading
+import json
+import time
+import hashlib
+import re
+import math
+import argparse
+from collections import defaultdict
+from typing import Dict, List, Set, Tuple, Optional
+from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pickle
+import signal
+
+# -------------------- Data models --------------------
+
+@dataclass
+class Document:
+    id: str
+    path: str
+    content: str
+    size: int
+    modified_time: float
+    word_count: int
+
+@dataclass
+class SearchResult:
+    doc_id: str
+    path: str
+    score: float
+    snippet: str
+    matches: List[str]
+
+# -------------------- Inverted Index --------------------
+
+class InvertedIndex:
+    def __init__(self):
+        self.index: Dict[str, Set[str]] = defaultdict(set)
+        self.documents: Dict[str, Document] = {}
+        self.term_frequencies: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    def add_document(self, doc: Document):
+        self.documents[doc.id] = doc
+        words = self._tokenize(doc.content.lower())
+        for word in words:
+            self.index[word].add(doc.id)
+            self.term_frequencies[doc.id][word] += 1
+
+    def _tokenize(self, text: str) -> List[str]:
+        return re.findall(r"\b\w+\b", text)
+
+    def search(self, query: str) -> List[str]:
+        terms = self._tokenize(query.lower())
+        if not terms:
+            return []
+        result_sets = [self.index[term] for term in terms if term in self.index]
+        if not result_sets:
+            return []
+        results = result_sets[0].copy()
+        for s in result_sets[1:]:
+            results &= s
+        return list(results)
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'index': self.index,
+                'documents': self.documents,
+                'term_frequencies': self.term_frequencies
+            }, f)
+
+    def load(self, path: str):
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+            self.index = data.get('index', defaultdict(set))
+            self.documents = data.get('documents', {})
+            self.term_frequencies = data.get('term_frequencies', defaultdict(lambda: defaultdict(int)))
+
+# -------------------- Ranker --------------------
+
+class MLRanker:
+    def __init__(self):
+        self.weights = {
+            'tf_idf': 0.4,
+            'title_match': 0.3,
+            'file_size': 0.1,
+            'recency': 0.2
+        }
+
+    def rank_results(self, query: str, doc_ids: List[str], index: InvertedIndex) -> List[SearchResult]:
+        results = []
+        query_terms = re.findall(r"\b\w+\b", query.lower())
+        for doc_id in doc_ids:
+            doc = index.documents.get(doc_id)
+            if not doc:
+                continue
+            score = self._calculate_score(query_terms, doc, index)
+            snippet = self._generate_snippet(query_terms, doc.content)
+            results.append(SearchResult(doc_id=doc_id, path=doc.path, score=score, snippet=snippet, matches=query_terms))
+        results.sort(key=lambda x: x.score, reverse=True)
+        return results
+
+    def _calculate_score(self, query_terms: List[str], doc: Document, index: InvertedIndex) -> float:
+        score = 0.0
+        tf_idf_score = 0.0
+        N = max(1, len(index.documents))
+        for term in query_terms:
+            tf = index.term_frequencies.get(doc.id, {}).get(term, 0)
+            df = len(index.index.get(term, []))
+            idf = math.log((N + 1) / (df + 1)) + 1.0
+            tf_idf_score += tf * idf
+        score += self.weights['tf_idf'] * tf_idf_score
+        filename = os.path.basename(doc.path).lower()
+        title_match = sum(1 for term in query_terms if term in filename)
+        score += self.weights['title_match'] * title_match
+        size_factor = 1.0 / (1.0 + doc.size / 10000.0)
+        score += self.weights['file_size'] * size_factor
+        current_time = time.time()
+        age_days = (current_time - doc.modified_time) / (24 * 3600) if doc.modified_time else float('inf')
+        recency_factor = 1.0 / (1.0 + age_days / 30.0)
+        score += self.weights['recency'] * recency_factor
+        return score
+
+    def _generate_snippet(self, query_terms: List[str], content: str, snippet_length: int = 200) -> str:
+        words = content.split()
+        if not words:
+            return ""
+        best_pos = 0
+        best_matches = -1
+        window_size = 20
+        max_start = max(0, len(words) - 1)
+        for i in range(0, max_start + 1):
+            window = ' '.join(words[i:i+window_size]).lower()
+            matches = sum(1 for term in query_terms if term in window)
+            if matches > best_matches:
+                best_matches = matches
+                best_pos = i
+        start = max(0, best_pos - 5)
+        end = min(len(words), best_pos + window_size + 5)
+        snippet = ' '.join(words[start:end])
+        if len(snippet) > snippet_length:
+            snippet = snippet[:snippet_length].rsplit(' ', 1)[0] + "..."
+        return snippet
+
+# -------------------- Crawler --------------------
+
+class FileSystemCrawler:
+    def __init__(self, max_file_size: int = 1024 * 1024, max_workers: int = 4):
+        self.max_file_size = max_file_size
+        self.supported_extensions = {'.txt', '.py', '.md', '.rst', '.c', '.cpp', '.java', '.js', '.html', '.css', '.xml', '.json'}
+        self.max_workers = max_workers
+
+    def crawl_dfs(self, root_path: str, max_depth: int = 10) -> List[Document]:
+        documents = []
+        visited = set()
+
+        def process_file(path: str):
+            doc = self._process_file(path)
+            return doc
+
+        stack = [(root_path, 0)]
+        file_paths_to_read = []
+        while stack:
+            path, depth = stack.pop()
+            if depth > max_depth or path in visited:
+                continue
+            visited.add(path)
+            try:
+                if os.path.isfile(path):
+                    file_paths_to_read.append(path)
+                elif os.path.isdir(path):
+                    try:
+                        entries = os.listdir(path)
+                        entries.sort(reverse=True)
+                        for entry in entries:
+                            if entry.startswith('.'):
+                                continue
+                            full_path = os.path.join(path, entry)
+                            stack.append((full_path, depth + 1))
+                    except PermissionError:
+                        print(f"Permission denied: {path}")
+            except Exception as e:
+                print(f"Error walking {path}: {e}")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+            futures = {ex.submit(process_file, p): p for p in file_paths_to_read}
+            for fut in as_completed(futures):
+                doc = fut.result()
+                if doc:
+                    documents.append(doc)
+
+        return documents
+
+    def _is_probably_text(self, file_path: str) -> bool:
+        try:
+            with open(file_path, 'rb') as f:
+                chunk = f.read(1024)
+                if not chunk:
+                    return True
+                if b'\x00' in chunk:
+                    return False
+                return True
+        except Exception:
+            return False
+
+    def _process_file(self, file_path: str) -> Optional[Document]:
+        try:
+            stat = os.stat(file_path)
+            if stat.st_size > self.max_file_size:
+                return None
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext not in self.supported_extensions:
+                return None
+            if not self._is_probably_text(file_path):
+                return None
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            doc_id = hashlib.md5(file_path.encode()).hexdigest()
+            word_count = len(re.findall(r"\b\w+\b", content))
+            return Document(id=doc_id, path=file_path, content=content, size=stat.st_size, modified_time=stat.st_mtime, word_count=word_count)
+        except Exception as e:
+            print(f"Error reading file {file_path}: {e}")
+            return None
+
+# -------------------- Search Node & Networking --------------------
+
+class SearchNode:
+    def __init__(self, node_id: str, host: str = 'localhost', port: int = 8000):
+        self.node_id = node_id
+        self.host = host
+        self.port = port
+        self.index = InvertedIndex()
+        self.ranker = MLRanker()
+        self.crawler = FileSystemCrawler()
+        self.peers: List[Tuple[str, int]] = []
+        self.running = False
+        self.server_socket: Optional[socket.socket] = None
+
+    def add_peer(self, host: str, port: int):
+        self.peers.append((host, port))
+
+    def index_directory(self, directory: str):
+        print(f"Node {self.node_id}: Indexing directory {directory}")
+        documents = self.crawler.crawl_dfs(directory)
+        for doc in documents:
+            self.index.add_document(doc)
+        print(f"Node {self.node_id}: Indexed {len(documents)} documents")
+
+    def search_local(self, query: str) -> List[SearchResult]:
+        doc_ids = self.index.search(query)
+        return self.ranker.rank_results(query, doc_ids, self.index)
+
+    def search_distributed(self, query: str, max_results: int = 10) -> List[SearchResult]:
+        all_results = []
+        local_results = self.search_local(query)
+        all_results.extend(local_results)
+        for host, port in self.peers:
+            try:
+                peer_results = self._query_peer(host, port, query)
+                all_results.extend(peer_results)
+            except Exception as e:
+                print(f"Error querying peer {host}:{port}: {e}")
+        all_results.sort(key=lambda x: x.score, reverse=True)
+        return all_results[:max_results]
+
+    def _recv_all(self, sock: socket.socket, n: int) -> bytes:
+        data = bytearray()
+        while len(data) < n:
+            packet = sock.recv(n - len(data))
+            if not packet:
+                raise ConnectionError("Socket closed before receiving expected bytes")
+            data.extend(packet)
+        return bytes(data)
+
+    def _query_peer(self, host: str, port: int, query: str) -> List[SearchResult]:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5.0)
+                sock.connect((host, port))
+                request = {'action': 'search', 'query': query, 'node_id': self.node_id}
+                data = json.dumps(request).encode('utf-8')
+                sock.send(len(data).to_bytes(4, 'big'))
+                sock.sendall(data)
+                raw_len = self._recv_all(sock, 4)
+                response_len = int.from_bytes(raw_len, 'big')
+                response_data = self._recv_all(sock, response_len)
+                response = json.loads(response_data.decode('utf-8'))
+                results = []
+                for rd in response.get('results', []):
+                    try:
+                        sr = SearchResult(
+                            doc_id=rd['doc_id'],
+                            path=rd['path'],
+                            score=float(rd.get('score', 0.0)),
+                            snippet=rd.get('snippet', ''),
+                            matches=rd.get('matches', [])
+                        )
+                        results.append(sr)
+                    except Exception:
+                        continue
+                return results
+        except Exception as e:
+            print(f"Error querying peer {host}:{port}: {e}")
+            return []
+
+    def start_server(self):
+        self.running = True
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+        self.server_socket.settimeout(1.0)
+        print(f"Node {self.node_id}: Server listening on {self.host}:{self.port}")
+        while self.running:
+            try:
+                client_socket, address = self.server_socket.accept()
+                t = threading.Thread(target=self._handle_client, args=(client_socket, address), daemon=True)
+                t.start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"Server error: {e}")
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
+
+    def _handle_client(self, client_socket: socket.socket, address):
+        try:
+            raw_len = self._recv_all(client_socket, 4)
+            request_len = int.from_bytes(raw_len, 'big')
+            request_data = self._recv_all(client_socket, request_len)
+            request = json.loads(request_data.decode('utf-8'))
+            if request.get('action') == 'search':
+                query = request.get('query', '')
+                results = self.search_local(query)
+                response = {'node_id': self.node_id, 'results': [asdict(r) for r in results]}
+                response_data = json.dumps(response).encode('utf-8')
+                client_socket.send(len(response_data).to_bytes(4, 'big'))
+                client_socket.sendall(response_data)
+        except Exception as e:
+            print(f"Error handling client {address}: {e}")
+        finally:
+            try:
+                client_socket.close()
+            except Exception:
+                pass
+
+    def stop_server(self):
+        self.running = False
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
+
+# -------------------- Main / CLI --------------------
+
+def main():
+    parser = argparse.ArgumentParser(description='Distributed Search Engine Node')
+    parser.add_argument('node_id', help='Node identifier')
+    parser.add_argument('index_dir', help='Directory to index')
+    parser.add_argument('--port', type=int, default=8000, help='Port for server (default 8000)')
+    parser.add_argument('--load-index', type=str, default=None, help='Path to load saved index (.pkl)')
+    parser.add_argument('--save-index', type=str, default=None, help='Path to save index on exit')
+    parser.add_argument('--max-depth', type=int, default=10, help='Max DFS depth for crawling')
+    parser.add_argument('--max-file-size', type=int, default=1024*1024, help='Max file size to index (bytes)')
+    args = parser.parse_args()
+
+    node = SearchNode(args.node_id, host='0.0.0.0', port=args.port)
+    node.crawler.max_file_size = args.max_file_size
+
+    # Load index if requested
+    if args.load_index and os.path.exists(args.load_index):
+        try:
+            node.index.load(args.load_index)
+            print(f"Loaded index from {args.load_index} (documents={len(node.index.documents)})")
+        except Exception as e:
+            print(f"Failed to load index: {e}")
+
+    # Start server thread
+    server_thread = threading.Thread(target=node.start_server, daemon=True)
+    server_thread.start()
+
+    # Index directory if not loaded
+    if not node.index.documents:
+        if os.path.exists(args.index_dir):
+            node.index_directory(args.index_dir)
+        else:
+            print(f"Directory {args.index_dir} does not exist")
+            node.stop_server()
+            return
+
+    # Graceful shutdown handler
+    stop_event = threading.Event()
+
+    def handle_sigint(signum, frame):
+        print('\nReceived interrupt, shutting down...')
+        stop_event.set()
+        node.stop_server()
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGTERM, handle_sigint)
+
+    print(f"\nSearch Engine Node {args.node_id} Ready on port {args.port}!")
+    print("Commands:\n  search <query>\n  dsearch <query>\n  add_peer <host> <port>\n  save_index <path>\n  load_index <path>\n  stats\n  quit")
+
+    try:
+        while not stop_event.is_set():
+            try:
+                command = input(f"\n{args.node_id}> ").strip()
+            except EOFError:
+                break
+            if not command:
+                continue
+            parts = command.split()
+            cmd = parts[0].lower()
+            if cmd == 'quit':
+                break
+            elif cmd == 'search' and len(parts) > 1:
+                query = ' '.join(parts[1:])
+                results = node.search_local(query)
+                print(f"\nFound {len(results)} results:")
+                for i, result in enumerate(results[:10], 1):
+                    print(f"\n{i}. {result.path}\n   Score: {result.score:.3f}\n   Snippet: {result.snippet}")
+            elif cmd == 'dsearch' and len(parts) > 1:
+                query = ' '.join(parts[1:])
+                results = node.search_distributed(query)
+                print(f"\nDistributed search found {len(results)} results:")
+                for i, result in enumerate(results[:10], 1):
+                    print(f"\n{i}. {result.path}\n   Score: {result.score:.3f}\n   Snippet: {result.snippet}")
+            elif cmd == 'add_peer' and len(parts) == 3:
+                host, port = parts[1], int(parts[2])
+                node.add_peer(host, port)
+                print(f"Added peer: {host}:{port}")
+            elif cmd == 'save_index' and len(parts) == 2:
+                path = parts[1]
+                try:
+                    node.index.save(path)
+                    print(f"Saved index to {path}")
+                except Exception as e:
+                    print(f"Failed to save index: {e}")
+            elif cmd == 'load_index' and len(parts) == 2:
+                path = parts[1]
+                try:
+                    node.index.load(path)
+                    print(f"Loaded index from {path}")
+                except Exception as e:
+                    print(f"Failed to load index: {e}")
+            elif cmd == 'stats':
+                print(f"\nIndex Statistics:\nDocuments: {len(node.index.documents)}\nUnique terms: {len(node.index.index)}\nPeers: {len(node.peers)}")
+            else:
+                print("Unknown command")
+    finally:
+        # Save index if requested on exit
+        if args.save_index:
+            try:
+                node.index.save(args.save_index)
+                print(f"Saved index to {args.save_index}")
+            except Exception as e:
+                print(f"Failed to save index on exit: {e}")
+        node.stop_server()
+        print("\nSearch engine stopped")
+
+if __name__ == '__main__':
+    main()
